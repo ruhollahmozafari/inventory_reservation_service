@@ -6,9 +6,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from domain.entities.reservation import Reservation, ReservationItem
-from domain.enums import ReservationStatus, HoldStatus
+from domain.enums import HoldStatus, ReservationStatus
 from domain.repositories.reservation_repo import AbstractReservationRepository
-from infra.db.models import ReservationModel, ReservationItemModel
+from infra.db.models import ReservationItemModel, ReservationModel
 
 
 class ReservationRepository(AbstractReservationRepository):
@@ -42,6 +42,7 @@ class ReservationRepository(AbstractReservationRepository):
                 expires_at=reservation.expires_at,
                 created_at=reservation.created_at,
                 confirmed_at=reservation.confirmed_at,
+                creation_deadline=reservation.creation_deadline,
             )
             self._session.add(row)
             for item in reservation.items:
@@ -53,12 +54,23 @@ class ReservationRepository(AbstractReservationRepository):
                     qty=item.qty,
                     provider_ref=item.provider_ref,
                     hold_status=item.hold_status,
+                    item_idempotency_key=item.idempotency_key,
                 ))
         else:
             row.status = reservation.status
+            row.expires_at = reservation.expires_at
             row.confirmed_at = reservation.confirmed_at
         await self._session.flush()
         return reservation
+
+    async def save_item(self, item: ReservationItem) -> None:
+        """Update hold_status and provider_ref for an already-persisted item."""
+        await self._session.execute(
+            update(ReservationItemModel)
+            .where(ReservationItemModel.id == item.id)
+            .values(hold_status=item.hold_status, provider_ref=item.provider_ref)
+        )
+        await self._session.flush()
 
     async def cas_status(
         self,
@@ -117,6 +129,7 @@ class ReservationRepository(AbstractReservationRepository):
                 qty=item.qty,
                 hold_status=item.hold_status,
                 provider_ref=item.provider_ref,
+                idempotency_key=item.item_idempotency_key,
             )
             for item in (row.items or [])
         ]
@@ -128,5 +141,6 @@ class ReservationRepository(AbstractReservationRepository):
             expires_at=row.expires_at,
             created_at=row.created_at,
             confirmed_at=row.confirmed_at,
+            creation_deadline=row.creation_deadline,
             items=items,
         )

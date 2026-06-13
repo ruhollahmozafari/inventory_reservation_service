@@ -2,6 +2,7 @@ from enum import Enum
 
 
 class ReservationStatus(str, Enum):
+    INITIALIZING = "INITIALIZING"  # write-ahead: intent committed, external calls in flight
     PENDING = "PENDING"
     CONFIRMING = "CONFIRMING"
     CONFIRMED = "CONFIRMED"
@@ -11,6 +12,7 @@ class ReservationStatus(str, Enum):
 
 
 class HoldStatus(str, Enum):
+    RESERVING = "RESERVING"  # write-ahead intent persisted, API call not yet made/confirmed
     HELD = "HELD"
     PENDING_UNKNOWN = "PENDING_UNKNOWN"
     RELEASED = "RELEASED"

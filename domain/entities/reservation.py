@@ -13,7 +13,8 @@ class ReservationItem:
     provider_id: UUID
     qty: int
     hold_status: HoldStatus
-    provider_ref: str | None = None  # remote hold id, if any
+    provider_ref: str | None = None   # remote hold id or "inventory_id:qty" for local
+    idempotency_key: str | None = None  # stored for RESERVING items so reconciler can find the hold
 
 
 @dataclass
@@ -31,6 +32,7 @@ class Reservation:
     created_at: datetime
     items: list[ReservationItem] = field(default_factory=list)
     confirmed_at: datetime | None = None
+    creation_deadline: datetime | None = None  # crash-recovery: INITIALIZING past this → roll back
 
     def is_terminal(self) -> bool:
         return self.status in (

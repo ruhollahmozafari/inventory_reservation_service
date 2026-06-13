@@ -91,6 +91,8 @@ class ReservationModel(Base):
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utcnow)
     confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # crash-recovery: INITIALIZING reservations past this timestamp are rolled back by the sweeper
+    creation_deadline: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     items: Mapped[list["ReservationItemModel"]] = relationship(
         back_populates="reservation", cascade="all, delete-orphan"
@@ -112,6 +114,8 @@ class ReservationItemModel(Base):
     hold_status: Mapped[HoldStatus] = mapped_column(
         SAEnum(HoldStatus, name="hold_status"), nullable=False, default=HoldStatus.PENDING_UNKNOWN
     )
+    # stored on RESERVING items so the reconciler can look up and release the hold by idempotency key
+    item_idempotency_key: Mapped[str | None] = mapped_column(String(256), nullable=True)
 
     __table_args__ = (
         CheckConstraint("qty > 0", name="ck_reservation_item_qty_positive"),

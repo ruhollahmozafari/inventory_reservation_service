@@ -46,6 +46,7 @@ class ProviderCapabilities:
     confirm: bool = False
     release: bool = False
     unconfirm: bool = False
+    auth_type: str = "bearer"  # "bearer" | "api_key" | "none"
 
 
 @runtime_checkable

@@ -13,6 +13,8 @@ class Settings(BaseSettings):
 
     # Reservation TTL in seconds before the expiry sweeper reclaims the hold
     RESERVATION_TTL_SECONDS: int = 900
+    # Grace window for crash-recovery sweeper: INITIALIZING reservations past this are rolled back
+    RESERVATION_CREATE_GRACE_SECONDS: int = 30
 
     # Key-encryption key for secrets stored in the provider table.
     # Must be a Fernet-compatible 32-byte url-safe base64 string.

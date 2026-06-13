@@ -17,13 +17,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from config import settings
 from domain.entities.outbox_task import OutboxTask
 from domain.enums import OrderStatus, OutboxTaskType
-from infra.db.models import OrderModel, ProviderModel
+from infra.db.models import OrderModel
 from infra.db.repositories.outbox_repo import OutboxRepository
+from infra.db.repositories.provider_repo import ProviderRepository
 from infra.db.session import AsyncSessionLocal
 from infra.db.transaction import atomic
+from infra.http.auth import build_auth
+from infra.http.provider_client import ProviderHttpClient
 from infra.providers.adapters.external_reserve import ExternalReserveAdapter
 from infra.providers.decorators.timeout import TimeoutDecorator
 from infra.providers.decorators.metrics import MetricsDecorator
+from infra.providers.port import ProviderCapabilities
 from infra.secrets.env_encrypted import EnvEncryptedSecretProvider
 
 log = logging.getLogger(__name__)
@@ -34,20 +38,23 @@ async def process_task(task: OutboxTask, session: AsyncSession) -> None:
     secret_provider = EnvEncryptedSecretProvider()
 
     provider_id = uuid.UUID(payload["provider_id"])
-    provider = await session.get(ProviderModel, provider_id)
+    provider = await ProviderRepository(session).get_by_id(provider_id)
     if provider is None:
         log.error("Task %s: provider %s not found", task.id, provider_id)
         return
 
-    adapter = ExternalReserveAdapter(
-        provider_id=provider_id,
-        base_url=provider.base_url or "",
+    timeout_s = provider.timeout_ms / 1000
+    auth = build_auth(
+        auth_type=provider.capabilities.get("auth_type", "bearer"),
         secret_ref=provider.secret_ref,
         secret_provider=secret_provider,
-        capabilities_cfg=provider.capabilities,
-        timeout_ms=provider.timeout_ms,
     )
-    adapter = MetricsDecorator(TimeoutDecorator(adapter, provider.timeout_ms / 1000), str(provider_id))
+    client = ProviderHttpClient(base_url=provider.base_url or "", auth=auth, timeout_s=timeout_s)
+    caps = ProviderCapabilities(**provider.capabilities)
+    adapter = MetricsDecorator(
+        TimeoutDecorator(ExternalReserveAdapter(client=client, capabilities=caps), timeout_s),
+        str(provider_id),
+    )
 
     ikey = task.idempotency_key
 
