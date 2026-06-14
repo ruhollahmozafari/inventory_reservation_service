@@ -2,157 +2,110 @@
 
 ## The core problem
 
-Strip away the CRUD and there is one hard problem: **two kinds of consistency collide in one checkout flow**.
-
-For internal stock, we own the database. A reservation is a conditional `UPDATE` — provably atomic, provably oversell-free. For external stock, the provider is the source of truth. Their API might time out, return a hold, or reject us. We cannot wrap our database write and their HTTP call in one transaction. We never could. The design question isn't whether to accept this — it's what to promise the user when we don't know whether the remote call took effect.
-
-Almost every decision below is really about managing that second boundary.
+Two kinds of consistency collide in one checkout flow. For internal stock we own the database — a reservation is a conditional `UPDATE`, provably atomic, provably oversell-free. For external providers the provider is the source of truth; their API might time out, return a hold, or reject the request. We can never wrap our database write and their HTTP call in one transaction. Every decision below is about managing that external boundary.
 
 ---
 
 ## What we invested in
 
-### 1. Oversell-safe inventory — expressed in the SQL, not the application
+### Oversell-safe inventory — expressed in SQL, not the application
 
-The usual mistake is: `SELECT qty_available`, check it, then `UPDATE qty_reserved`. This has a race window. Two transactions can both read "1 unit available" and both succeed.
-
-We do one statement with the guard in the `WHERE`:
+Reserve is a single conditional statement:
 
 ```sql
 UPDATE inventory
 SET qty_reserved = qty_reserved + :q
-WHERE id = :id
-  AND (qty_on_hand - qty_reserved) >= :q
+WHERE id = :id AND (qty_on_hand - qty_reserved) >= :q
 ```
 
-`rowcount == 1` means stock was available and is now held, atomically, without any separate lock. `rowcount == 0` is a clean "insufficient stock" signal, not an error. Release and consume are the same pattern. This is the most important thing in the codebase — everything else can be changed more cheaply than a broken oversell guard.
+`rowcount == 1` means stock was available and is now held, atomically, without a separate lock or read-then-write race. Release and consume follow the same pattern. This is the most important property in the codebase — everything else can be changed more cheaply than a broken oversell guard.
 
-We chose this over `SELECT FOR UPDATE` (heavier, needed only for multi-statement logic) and optimistic versioning (adds a retry loop at application layer for no correctness gain here).
+We chose this over `SELECT FOR UPDATE` (heavier, only needed for multi-statement logic) and optimistic versioning (adds an application-layer retry loop for no correctness gain here).
 
-### 2. Provider abstraction with no type conditionals in the orchestrator
+### Three-transaction saga with write-ahead intent
 
-The orchestrator — `CreateReservationUseCase` — has zero `if provider.type == "internal"` branches. Three adapters (`InternalAdapter`, `ExternalReserveAdapter`, `SoftHoldAdapter`) implement the same `ReservableProvider` protocol. The difference between "run a SQL UPDATE" and "make an HTTP call" is entirely inside the adapter. The orchestrator doesn't know.
+The create flow uses three transaction windows to survive crashes at any point:
 
-This matters because type conditionals scatter across the codebase as the number of provider types grows. Every new provider type forces changes in every place that branches on type. With the Strategy pattern, adding a fourth provider type means writing a new adapter class, nothing else.
+**TX1 (intent-first):** All DB work — provider lookup, internal/soft-hold stock deduction, write-ahead `RESERVING` intent rows for external items, reservation INSERT as `INITIALIZING`. Commits before any external HTTP call. The `INITIALIZING` status and the `idempotency_key` stored on each intent row are the crash-recovery handles: a sweeper finds stale `INITIALIZING` reservations and rolls them back safely.
 
-The decorator chain (`TimeoutDecorator → MetricsDecorator → adapter`) composes cross-cutting concerns without touching adapter logic. Timeout is enforced uniformly whether the underlying operation is a DB query or an HTTP call.
+**TX_n (per external item):** After each provider API call, a short atomic block flips the item from `RESERVING` to `HELD`, `FAILED`, or `PENDING_UNKNOWN`. Crashes between calls leave the intent row in the DB for reconciliation.
 
-### 3. The timeout/unknown-outcome handling — the design centerpiece
+**TX_final:** CAS `INITIALIZING → PENDING` (success) or `→ FAILED` (any item failed), with compensation enqueued in the same atomic.
 
-On `reserve()` timeout, we don't know if the hold was placed. Three options:
+No DB session is active during external HTTP calls. This is the most operationally important rule after the oversell guard — holding a transaction across a network call causes lock contention that compounds under load.
 
-- **Assume success**: dangerous — may confirm an inventory item that isn't held, creating phantom stock.
-- **Assume failure**: safer but leaves an orphaned hold at the provider if the call did succeed, causing stock to be unavailable indefinitely.
-- **Fail-closed + reconcile**: what we do. Fail the reservation. Mark the item `PENDING_UNKNOWN`. Enqueue a `RECONCILE` task that releases by the idempotency key — a safe no-op if nothing was held, a release if something was.
+### Timeout handling — the design centerpiece
 
-The RECONCILE task is safe because we generated the idempotency key before the call: `"{reservation_id}:{product_id}:{provider_id}"`. The provider sees the same key on the reconcile request and treats it as idempotent. Three patterns composing to handle one failure case: saga compensation (release the hold), outbox (make that release durable), idempotency (make the release retry-safe).
+On a `reserve()` timeout we cannot know if the hold was placed. Three options:
 
-We distinguish timeout (unknown outcome → RECONCILE) from other adapter exceptions (connection refused, 4xx, bad JSON → definitive failure, no orphan possible, compensate siblings directly).
+- **Assume success**: may confirm un-held inventory.
+- **Assume failure**: leaves an orphaned hold at the provider indefinitely.
+- **Fail-closed + reconcile**: what we do. Mark item `PENDING_UNKNOWN`. Enqueue a `RECONCILE` task that releases by idempotency key — safe no-op if nothing was held, release if something was.
 
-### 4. Transaction boundaries made explicit
+Three patterns compose here: saga compensation, transactional outbox (durable enqueue), and idempotency key (release is retry-safe). We distinguish timeout (unknown outcome → RECONCILE) from definitive failures like connection refused or 4xx (no hold possible → no RECONCILE needed).
 
-Every state-changing operation wraps its DB writes in an `atomic()` context manager:
+### Provider abstraction with three adapters
 
-```python
-async with atomic(self._session):
-    # everything here commits together; any exception rolls back
-```
+`InternalAdapter`, `ExternalReserveAdapter`, and `SoftHoldAdapter` implement the same `ReservableProvider` protocol. The orchestrator has zero `if provider.type ==` branches in the reservation flow — routing happens once in `_build_adapter()`. Adding a new provider type means a new adapter class, not changes to the orchestrator.
 
-Repositories never call `session.commit()`. The use-case layer owns transaction scope. This enforces the two-phase structure: provider calls happen outside any transaction (no DB lock held during HTTP), then all DB writes commit once. The transaction windows are visible in the code.
+**SoftHoldAdapter** is for read-only external providers that expose only a stock-query API. We mirror their inventory in our DB (kept fresh by a background sync worker) and reserve against the local mirror. No HTTP call during the hot reservation path. Accepted trade-off: sync lag can cause soft-oversell, caught at confirm time and routed to `NEEDS_RESOLUTION`.
 
-This rule — never hold a DB transaction across a network call — is the single most operationally important correctness property after the oversell guard. Violating it causes lock contention that compounds under load.
+**HTTP concerns are separated from provider logic.** `ProviderHttpClient` owns base URL, idempotency header injection, and auth. Auth strategies (`BearerAuth`, `ApiKeyAuth`, `NoAuth`) are selected at adapter construction from the provider's `capabilities.auth_type` field. Adding a new auth scheme is one class, zero adapter changes.
 
-### 5. Durable side effects via transactional outbox
+### Transactional outbox for durable side effects
 
-When a reservation expires, we must mark it `EXPIRED` and release the holds. Two naive approaches both fail:
-
-- **Mark expired, then call release**: if the process crashes between the DB commit and the release call, the hold leaks permanently. The provider has stock locked forever.
-- **Call release, then mark expired**: if release succeeds but the DB commit fails, the reservation stays `PENDING` and the expiry sweeper retries — calling release again on a hold that no longer exists.
-
-The outbox solves this by writing the release intent into the same transaction as the state change. The worker drains it with retries. Durability transfers from "hope the process doesn't crash between two operations" to "at-least-once processing with idempotent operations."
-
-We chose a dedicated outbox table over a status column because a single reservation has N items across M providers, each needing independent retry metadata (attempts, backoff, last_error, lease). The generic worker handles all task types: `RELEASE`, `CONFIRM`, `UNCONFIRM`, `RECONCILE`.
+The outbox solves the "two operations, one must not fail" problem. Release intent is written in the same transaction as the status change. The outbox worker drains with retries and exponential backoff. Durability transfers from "hope the process doesn't crash between two operations" to "at-least-once with idempotent operations." A dedicated outbox table (not a status column) is correct because each reservation item needs independent retry metadata.
 
 ---
 
 ## What we kept simple
 
-### Auth — stored and used, not rotated
+**Auth — stored but not rotated.** Provider credentials are stored encrypted (`EnvEncryptedSecretProvider`). The `SecretProvider` port exists to swap in Vault without touching adapters. Secret rotation is a production concern deliberately deferred — the interface boundary is in place.
 
-Provider credentials are stored encrypted in the database (`EnvEncryptedSecretProvider`): the encrypted value is in the `provider.secret_ref` column, the key-encryption key comes from an environment variable. `ProviderCapabilities.auth_type` controls how the decrypted secret is injected — Bearer token, API key header, or none.
+**Resilience — timeout + circuit breaker implemented, not wired.** `TimeoutDecorator` wraps every adapter call. `CircuitBreakerDecorator` is also implemented — three-state (closed/open/half-open), Redis-backed so state is shared across instances. Failure counter uses `INCR + EXPIRE` (rolling window); open flag uses `SET ex cooldown` (TTL gives free auto-cooldown); half-open probe uses `SET NX`. It is not yet injected into `_build_adapter` because it requires a Redis client to be available at construction time — wiring it in is the next step once Redis is provisioned.
 
-The separation is deliberate: where the secret is stored, how it's encrypted, and how it's used in HTTP calls are independent concerns. Adding a new auth scheme is one change in `_auth_headers()`. Swapping to Vault is a new `SecretProvider` implementation, nothing else.
+**Expiry sweeper implemented, kept simple.** The sweeper (`workers/expiry_sweeper.py`) scans for `PENDING` reservations past `expires_at`, atomically flips them to `EXPIRED` in a single `UPDATE ... RETURNING` (no SKIP LOCKED needed — the UPDATE itself is the claim), then releases internal stock inline and enqueues `RELEASE` outbox tasks for external items. All DB work, no HTTP. The slow HTTP release calls run in the outbox worker. The sweeper follows the same polling loop pattern as the outbox worker.
 
-What we didn't build: secret rotation, Vault integration, per-request token refresh for OAuth-style credentials. These are production concerns deferred correctly — the port exists to add them without touching adapters.
+**No registry class.** `_build_adapter()` on each use case is equivalent (no type-conditionals in flow, adapter construction is encapsulated) but duplicated. A dedicated registry would be independently testable and reusable. Simplification was intentional; the debt is real.
 
-### Resilience decorators — timeout only
-
-The decorator chain is in place. `TimeoutDecorator` wraps every adapter call. `MetricsDecorator` logs per-provider latency.
-
-Not implemented: circuit breaker, retry with backoff. The circuit breaker is the more significant gap. Without it, a provider that's reliably slow (4.9s per call, just under a 5s timeout) degrades every checkout touching it. Users wait 5 seconds before seeing a failure. With a three-state circuit breaker, after a failure threshold the breaker opens and subsequent calls fail in ~1ms — fast degradation instead of slow degradation.
-
-The retry decorator is lower priority because the outbox already handles retry for background operations, and retrying synchronous reserve calls has idempotency requirements we'd need to enforce carefully.
-
-### No registry class
-
-The BUILD-SPEC describes a `Registry/Factory` mapping `provider_id → adapter` at runtime. We implemented this as `_build_adapter(provider_id)` on each use case — it reads the provider row, branches on type and capabilities, returns the wrapped adapter.
-
-The result is equivalent (no type conditionals in the flow, adapter construction is encapsulated) but a dedicated registry class would be: independently unit-testable, reusable across use cases without duplication, and the right place to cache provider metadata lookups. The simplification is real; the debt is also real.
-
-### Workers — outbox only, sweeper not implemented
-
-The outbox worker is implemented: claim batch with SKIP LOCKED, process HTTP, commit done/failed with backoff. Not implemented: the expiry sweeper (which scans for `PENDING` reservations past `expires_at`, flips to `EXPIRED`, enqueues releases per line). Without it, reservations expire in state but holds aren't automatically released. The sweeper is a background worker following the exact same SKIP LOCKED pattern as the outbox worker — the design is fully worked out, the implementation was deferred for time.
-
-### Sequential provider calls in Phase 1
-
-The reservation saga calls providers one by one in the `for` loop. For a 3-provider cart at 300ms each, the user waits ~900ms in provider calls alone. With `asyncio.gather()` this becomes ~300ms (max, not sum). The code change is small; the compensation logic gets more complex (parallel failures need coordinated cleanup). Deferred, not forgotten.
+**Sequential external calls.** For a multi-provider cart, provider calls execute one-by-one. `asyncio.gather()` would reduce latency from `sum(latencies)` to `max(latencies)` — the code change is small, the compensation logic for parallel partial failures is more complex.
 
 ---
 
 ## Assumptions where the spec was silent
 
-**All-or-nothing reservations.** If a 3-item cart has one item that fails to reserve, the whole reservation fails and all held items are compensated. Partial reservations create UX problems (user pays, only gets some items) and complicate the downstream order flow. We make partial success an explicit non-goal.
+**All-or-nothing reservations.** If any item in a cart fails to reserve, the whole reservation fails and all held items are compensated. Partial reservations create downstream UX problems and complicate the order flow.
 
-**Confirm is forward-only.** Once payment is taken, we drive toward completion — we never roll back a confirmed payment. A confirm failure becomes `PENDING_FULFILMENT` and the outbox retries asynchronously. A definitive rejection becomes `NEEDS_RESOLUTION` — the order exists but requires human intervention or a refund flow. We do not attempt to undo a payment.
+**Confirm is forward-only.** Once payment is taken, we drive toward completion. A confirm failure becomes `PENDING_FULFILMENT` with outbox retry; a definitive rejection becomes `NEEDS_RESOLUTION` requiring human intervention. We do not attempt to undo a payment.
 
-**Service-to-service calls, not user-facing auth.** `user_id` comes from a trusted upstream service in the request body. The spec says auth is out of scope; we assume the calling service has already validated the user and is passing a verified identifier.
+**Service-to-service auth, not user auth.** `user_id` comes from a trusted upstream service. The spec marks user auth as out of scope.
 
-**Internal adapter is fully atomic with Phase 2.** `InternalAdapter` shares the use-case SQLAlchemy session. The inventory `UPDATE` in Phase 1 and the reservation `INSERT` in Phase 2 commit in the same transaction. This is not obvious from the code structure but is a load-bearing correctness property: if Phase 2 fails, Phase 1's inventory change rolls back automatically.
-
-**Provider capability as configuration, not code.** `ProviderCapabilities` is a struct populated from the provider's `capabilities` JSONB column. Adding `unconfirm=true` to a provider's DB record gives it unconfirm behavior without a code deployment. This lets provider capability evolve without service restarts.
+**Provider capability as configuration, not code.** `ProviderCapabilities` is populated from a JSONB column. Setting `unconfirm=true` on a provider record changes its behavior without a code deployment.
 
 ---
 
-## Why these scenarios
+## Scenarios demonstrated
 
-The task asks us to choose the most important scenarios to demonstrate. We implemented four:
+We chose the four scenarios that cover the most distinct failure modes:
 
-**1. Internal reserve with no-oversell concurrency proof.** This is the most critical correctness property. We run 5 concurrent reservations on 1 unit of stock and assert exactly 1 succeeds. This is not a unit test with mocks — it exercises real concurrent Postgres transactions and proves the conditional update holds under contention. If this test fails, nothing else matters.
+1. **Internal reserve with concurrency proof.** 5 concurrent reserves on 1 unit of stock → exactly 1 PENDING, 4 FAILED. Exercises real concurrent Postgres transactions, not mocks. Proves the conditional UPDATE holds under contention.
 
-**2. External reserve with mocked HTTP.** Demonstrates the provider abstraction — the orchestrator doesn't change, only the adapter. Mocking at `ExternalReserveAdapter.reserve` (class level) ensures the mock is reached even through the `MetricsDecorator → TimeoutDecorator → adapter` chain. `assert_called_once()` proves the execution path is correct.
+2. **External reserve (mocked HTTP).** Proves the provider abstraction — the orchestrator is unchanged whether the adapter does a DB write or an HTTP call. `assert_called_once()` verifies the execution path is correct.
 
-**3. External reserve + confirm full happy path.** The end-to-end TCC lifecycle: reserve → confirm → CONFIRMED + order created. This proves the two-window atomic design (CAS PENDING→CONFIRMING, then confirm + order commit) works correctly.
+3. **External reserve + confirm, full happy path.** End-to-end TCC lifecycle: reserve → confirm → `CONFIRMED` + order created. Proves the two CAS windows (`PENDING→CONFIRMING`, then confirm + order) work correctly.
 
-**4. Concurrent reserves on last unit (no-oversell with internal provider).** Separate from scenario 1 — this uses the use case layer directly (not the HTTP API) to test true concurrent sessions. It confirms the no-oversell property holds across different code paths.
+4. **Timeout → PENDING_UNKNOWN + RECONCILE.** Simulates a provider timeout and asserts the item is marked `PENDING_UNKNOWN` and a `RECONCILE` outbox task is enqueued. This is the architecturally most interesting failure case — the system must survive not knowing whether a hold was placed.
 
-Not demonstrated with a test: the timeout → `PENDING_UNKNOWN` → `RECONCILE` path (scenario B from BUILD-SPEC). This is architecturally the most interesting case — the code is fully implemented — but writing an integration test for it requires either a mock that simulates a `TimeoutError` partway through, or a real slow provider. Deferred for time; the design reasoning is in DESIGN-NOTES.md §4.5.
+Additional tests cover: provider rejection (definitive failure, no RECONCILE), idempotency (duplicate key returns same reservation), soft-hold (read-only provider reserves against local DB mirror), and insufficient stock (TX1 rollback, nothing persisted).
 
 ---
 
 ## What we'd do differently with more time
 
-**Event-sourced inventory ledger.** Replace `qty_on_hand`/`qty_reserved` counters with append-only movement rows:
+**Event-sourced inventory ledger.** Replace `qty_on_hand`/`qty_reserved` counters with append-only movement rows. Available balance = `SUM(on_hand) - SUM(reserved)`. Each reserve is an INSERT (no hot-row lock contention), the audit trail is free, and idempotency is a unique constraint violation.
 
-```sql
-inventory_movement(id, inventory_id, type ENUM('reserve','release','consume'), qty, reservation_item_id, created_at)
-```
+**Circuit breaker.** Three-state, state in Redis (shared across instances). Open threshold: N failures in a rolling window. This is the highest-impact missing piece for production reliability.
 
-Available balance = `SUM(qty ON_HAND) - SUM(qty RESERVED)`. This solves hot-row contention at the root (each reserve is a new INSERT, no row lock contention), gives a free audit trail, and makes idempotency natural (duplicate movement_id = unique constraint violation, not a double-count). The SCALABILITY.md section explains why this matters more than people expect at scale.
+**Alembic migrations.** Currently `Base.metadata.create_all()` for dev. Production requires reviewed migration scripts for every schema change.
 
-**Circuit breaker with Redis-backed shared state.** Three-state (closed → open → half-open), state in Redis so all app instances coordinate. The `CircuitBreakerDecorator` wraps any adapter. Open threshold: N failures in a rolling window (`INCR`/`EXPIRE`). Open flag: `SET key EX cooldown` (TTL gives free auto-cooldown). Half-open trial: `SET NX`. This is the highest-impact missing piece for production reliability.
-
-**Parallel provider calls.** `asyncio.gather()` in Phase 1 with structured compensation on partial failure. For a multi-provider cart, this changes user-facing latency from `sum(latencies)` to `max(latencies)`.
-
-**Vault + secret rotation.** The `SecretProvider` port exists. Add `VaultSecretProvider` that fetches secrets with a short TTL and re-fetches on cache miss. Rotation happens outside the service.
-
-**Alembic migrations.** Currently `Base.metadata.create_all()` for dev. Alembic `--autogenerate` + reviewed migration scripts for every schema change. Non-negotiable for production.
+**Parallel provider calls.** `asyncio.gather()` across external items in the same cart. Changes user-facing latency from `sum(latencies)` to `max(latencies)`.

@@ -11,10 +11,12 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.use_cases.create_reservation import CreateReservationUseCase
-from domain.enums import ReservationStatus
+from domain.enums import OutboxTaskType, ReservationStatus
+from infra.db.models import OutboxModel
 from infra.providers.adapters.external_reserve import ExternalReserveAdapter
 from infra.providers.port import ConfirmResult, ReserveResult
 from tests.factories import create_inventory, create_product, create_provider
@@ -134,3 +136,169 @@ class TestNoOversell:
 
         assert statuses.count("PENDING") == 1
         assert statuses.count("FAILED") == 4
+
+
+class TestExternalFailures:
+    async def test_timeout_marks_item_pending_unknown_and_enqueues_reconcile(
+        self, client: AsyncClient, db_session: AsyncSession
+    ):
+        """
+        Provider timeout → PENDING_UNKNOWN item + RECONCILE outbox task.
+        The system can't know whether the hold was placed, so it fails the reservation
+        and enqueues a RECONCILE task to release the hold by idempotency key if it exists.
+        """
+        product = await create_product(db_session)
+        provider = await create_provider(
+            db_session, provider_type="external", base_url="http://warehouse.test"
+        )
+        await create_inventory(db_session, product.id, provider.id, qty_on_hand=10)
+        await db_session.commit()
+
+        with patch.object(ExternalReserveAdapter, "reserve", new_callable=AsyncMock) as mock:
+            mock.side_effect = TimeoutError("simulated timeout")
+            response = await client.post(
+                "/api/v1/reservations",
+                json={
+                    "user_id": "user-1",
+                    "idempotency_key": f"idem-{uuid.uuid4()}",
+                    "items": [{"product_id": str(product.id), "provider_id": str(provider.id), "qty": 2}],
+                },
+            )
+
+        assert response.status_code == 201
+        body = response.json()
+        assert body["status"] == "FAILED"
+        assert body["items"][0]["hold_status"] == "PENDING_UNKNOWN"
+
+        tasks = (await db_session.scalars(
+            select(OutboxModel).where(OutboxModel.task_type == OutboxTaskType.RECONCILE)
+        )).all()
+        assert len(tasks) == 1
+        assert tasks[0].payload["provider_id"] == str(provider.id)
+
+    async def test_provider_rejection_creates_failed_reservation(
+        self, client: AsyncClient, db_session: AsyncSession
+    ):
+        """
+        Provider returns success=False (e.g. 409 insufficient stock) → reservation FAILED,
+        no RECONCILE needed because no hold was placed.
+        """
+        product = await create_product(db_session)
+        provider = await create_provider(
+            db_session, provider_type="external", base_url="http://warehouse.test"
+        )
+        await create_inventory(db_session, product.id, provider.id, qty_on_hand=10)
+        await db_session.commit()
+
+        with patch.object(ExternalReserveAdapter, "reserve", new_callable=AsyncMock) as mock:
+            mock.return_value = ReserveResult(success=False, error="Provider: insufficient stock")
+            response = await client.post(
+                "/api/v1/reservations",
+                json={
+                    "user_id": "user-1",
+                    "idempotency_key": f"idem-{uuid.uuid4()}",
+                    "items": [{"product_id": str(product.id), "provider_id": str(provider.id), "qty": 2}],
+                },
+            )
+
+        assert response.status_code == 201
+        body = response.json()
+        assert body["status"] == "FAILED"
+        assert body["items"][0]["hold_status"] == "FAILED"
+
+        # Definitive failure — no orphan possible, so no RECONCILE task.
+        reconcile_tasks = (await db_session.scalars(
+            select(OutboxModel).where(OutboxModel.task_type == OutboxTaskType.RECONCILE)
+        )).all()
+        assert len(reconcile_tasks) == 0
+
+
+class TestIdempotency:
+    async def test_duplicate_request_returns_same_reservation(
+        self, client: AsyncClient, db_session: AsyncSession
+    ):
+        """Same idempotency key on two requests → same reservation ID, no double-reserve."""
+        product = await create_product(db_session)
+        provider = await create_provider(db_session, provider_type="internal")
+        await create_inventory(db_session, product.id, provider.id, qty_on_hand=10)
+        await db_session.commit()
+
+        idem_key = f"idem-{uuid.uuid4()}"
+        body = {
+            "user_id": "user-1",
+            "idempotency_key": idem_key,
+            "items": [{"product_id": str(product.id), "provider_id": str(provider.id), "qty": 1}],
+        }
+
+        first = await client.post("/api/v1/reservations", json=body)
+        second = await client.post("/api/v1/reservations", json=body)
+
+        assert first.status_code == 201
+        assert second.status_code == 201
+        assert first.json()["id"] == second.json()["id"]
+        assert first.json()["status"] == "PENDING"
+
+
+class TestSoftHold:
+    async def test_soft_hold_reserves_against_local_db_mirror(
+        self, client: AsyncClient, db_session: AsyncSession
+    ):
+        """
+        Read-only provider (capabilities.reserve=False) → SoftHoldAdapter, zero HTTP calls.
+        Reserve deducts from the local DB mirror kept fresh by the availability sync worker.
+        provider_ref encodes "inventory_id:qty" so release can undo it without a network call.
+        """
+        product = await create_product(db_session)
+        provider = await create_provider(
+            db_session,
+            provider_type="external",
+            capabilities={"reserve": False, "confirm": False, "release": False, "unconfirm": False},
+        )
+        await create_inventory(db_session, product.id, provider.id, qty_on_hand=10)
+        await db_session.commit()
+
+        response = await client.post(
+            "/api/v1/reservations",
+            json={
+                "user_id": "user-1",
+                "idempotency_key": f"idem-{uuid.uuid4()}",
+                "items": [{"product_id": str(product.id), "provider_id": str(provider.id), "qty": 3}],
+            },
+        )
+
+        assert response.status_code == 201
+        body = response.json()
+        assert body["status"] == "PENDING"
+        assert body["items"][0]["hold_status"] == "HELD"
+        # provider_ref encodes "inventory_id:qty" for local release (no HTTP needed)
+        ref = body["items"][0]["provider_ref"]
+        assert ref is not None and ":" in ref
+        qty_in_ref = int(ref.split(":")[1])
+        assert qty_in_ref == 3
+
+    async def test_insufficient_internal_stock_fails_cleanly(
+        self, client: AsyncClient, db_session: AsyncSession
+    ):
+        """
+        Reserve qty exceeds available stock → reservation FAILED before any external call.
+        TX1 rolls back cleanly; nothing is persisted in the DB.
+        """
+        product = await create_product(db_session)
+        provider = await create_provider(db_session, provider_type="internal")
+        await create_inventory(db_session, product.id, provider.id, qty_on_hand=1)
+        await db_session.commit()
+
+        response = await client.post(
+            "/api/v1/reservations",
+            json={
+                "user_id": "user-1",
+                "idempotency_key": f"idem-{uuid.uuid4()}",
+                "items": [{"product_id": str(product.id), "provider_id": str(provider.id), "qty": 5}],
+            },
+        )
+
+        assert response.status_code == 201
+        body = response.json()
+        assert body["status"] == "FAILED"
+        # TX1 rolled back → no items persisted, nothing to compensate
+        assert body["items"] == []

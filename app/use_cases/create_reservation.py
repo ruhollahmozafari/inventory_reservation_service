@@ -91,8 +91,9 @@ class CreateReservationUseCase:
 
                     adapter = self._build_adapter(provider)
 
-                    if provider.capabilities.get("reserve"):
-                        # External: write intent only — API call happens after TX1.
+                    if provider.type != ProviderType.INTERNAL and provider.capabilities.get("reserve"):
+                        # External provider with a reserve API: write-ahead intent only.
+                        # API call happens after TX1 so no DB lock is held during HTTP.
                         external_adapters[item_id] = adapter
                         held_items.append(ReservationItem(
                             id=item_id, reservation_id=reservation_id,
@@ -101,7 +102,8 @@ class CreateReservationUseCase:
                             provider_ref=None, idempotency_key=item_key,
                         ))
                     else:
-                        # Internal or soft-hold: reserve against local DB inside this TX.
+                        # Internal or soft-hold: reserve against local DB inside TX1.
+                        # This makes the stock deduction atomic with the reservation INSERT.
                         result = await adapter.reserve(product_id, provider_id, qty, item_key)
                         if not result.success:
                             raise _LocalStockError(result.error or "reserve failed")
